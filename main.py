@@ -1,11 +1,13 @@
 import cv2
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, scrolledtext
 from pylibdmtx import pylibdmtx
 import numpy as np
 import time
 import sys
 from queue import Empty
+from typing import Optional, Tuple, List
+from datetime import datetime
 
 
 # ---------- поиск камер ----------
@@ -24,8 +26,17 @@ class DataMatrixScanner:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("DataMatrix Scanner")
+        self.root.geometry("400x600")
+        
+        # Центрирование окна
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
 
-        self.cap = None
+        self.cap: Optional[cv2.VideoCapture] = None
         self.running = False
 
         # параметры логирования
@@ -34,6 +45,9 @@ class DataMatrixScanner:
         # учёт кодов
         self.seen_codes = set()
         self.code_counter = 0
+        self.scanned_codes = []  # Список всех отсканированных кодов
+        self.scan_start_time = None
+        self.time_for_10_codes = None
 
         # трекинг рамок
         self.tracked = {}  # code -> {polygon, last_seen}
@@ -44,6 +58,25 @@ class DataMatrixScanner:
         self.roi_last_seen = 0
         self.ROI_TIMEOUT = 0.3
         self.frame_counter = 0
+        # лёгкий цифровой зум
+        self.zoom_factor = 1.25
+
+        # Настройки камеры
+        self.camera_settings = {
+            'width': 1920,
+            'height': 1080,
+            'fps': 30,
+            'fourcc': cv2.VideoWriter.fourcc(*"MJPG")
+        }
+
+        # Доступные разрешения
+        self.resolutions = [
+            (640, 480),
+            (800, 600),
+            (1024, 768),
+            (1280, 720),
+            (1920, 1080),
+        ]
 
         # очереди для декодирования
         import queue
@@ -55,7 +88,7 @@ class DataMatrixScanner:
         self.worker_thread = threading.Thread(target=self.decode_worker, daemon=True)
         self.worker_thread.start()
 
-        # UI
+        # UI переменные
         cams = list_cameras()
         if not cams:
             messagebox.showerror("Ошибка", "Камеры не найдены")
@@ -63,26 +96,287 @@ class DataMatrixScanner:
             return
 
         self.selected_camera = tk.IntVar(value=cams[0])
+        self.selected_resolution = tk.StringVar(value="1920x1080")
 
-        ttk.Label(root, text="Выберите камеру:").pack(padx=10, pady=5)
-        ttk.Combobox(
-            root, values=cams, state="readonly",
-            textvariable=self.selected_camera, width=10
-        ).pack(padx=10, pady=5)
-
-        ttk.Button(
-            root, text="Открыть камеру",
-            command=self.start
-        ).pack(padx=10, pady=5)
-
-        ttk.Button(
-            root, text="Очистить скан",
-            command=self.reset_scan
-        ).pack(padx=10, pady=5)
+        # Создание отдельных окон
+        self.create_main_window()
+        self.create_codes_window()
+        self.create_settings_window()
 
         # горячая клавиша: C — очистить скан
         self.root.bind("<c>", lambda e: self.reset_scan())
         self.root.bind("<C>", lambda e: self.reset_scan())
+
+    def create_main_window(self):
+        """Создание главного окна управления"""
+        # Стиль
+        style = ttk.Style()
+        style.configure("TButton", padding=10, font=('Arial', 10))
+        
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Заголовок
+        title_label = ttk.Label(main_frame, text="DataMatrix Scanner", 
+                               font=('Arial', 16, 'bold'))
+        title_label.pack(pady=(0, 20))
+
+        # Выбор камеры
+        camera_frame = ttk.LabelFrame(main_frame, text="Настройка камеры", padding="10")
+        camera_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(camera_frame, text="Выберите камеру:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        camera_combo = ttk.Combobox(
+            camera_frame, values=list_cameras(), state="readonly",
+            textvariable=self.selected_camera, width=15
+        )
+        camera_combo.grid(row=0, column=1, padx=5)
+        
+        ttk.Label(camera_frame, text="Разрешение:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=(10,0))
+        resolution_combo = ttk.Combobox(
+            camera_frame, 
+            values=[f"{w}x{h}" for w, h in self.resolutions],
+            state="readonly",
+            textvariable=self.selected_resolution, 
+            width=15
+        )
+        resolution_combo.grid(row=1, column=1, padx=5, pady=(10,0))
+
+        # Кнопки управления
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=20)
+
+        self.start_button = ttk.Button(
+            button_frame, text="▶ Запустить сканирование",
+            command=self.start, style="TButton"
+        )
+        self.start_button.pack(fill=tk.X, pady=5)
+
+        self.clear_button = ttk.Button(
+            button_frame, text="🗑 Очистить все коды",
+            command=self.reset_scan
+        )
+        self.clear_button.pack(fill=tk.X, pady=5)
+
+        self.settings_button = ttk.Button(
+            button_frame, text="⚙ Настройки камеры",
+            command=self.show_settings_window
+        )
+        self.settings_button.pack(fill=tk.X, pady=5)
+
+        self.codes_button = ttk.Button(
+            button_frame, text="📋 Показать отсканированные коды",
+            command=self.show_codes_window
+        )
+        self.codes_button.pack(fill=tk.X, pady=5)
+
+        # Счетчик времени
+        self.time_frame = ttk.LabelFrame(main_frame, text="Время сканирования", padding="10")
+        self.time_frame.pack(fill=tk.X, pady=10)
+
+        self.time_label = ttk.Label(self.time_frame, text="Время для 10 кодов: --", 
+                                   font=('Arial', 10))
+        self.time_label.pack()
+
+        self.counter_label = ttk.Label(self.time_frame, text="Отсканировано кодов: 0", 
+                                      font=('Arial', 10))
+        self.counter_label.pack()
+
+        # Статус
+        self.status_label = ttk.Label(main_frame, text="Готов к работе", 
+                                     foreground="green", font=('Arial', 9))
+        self.status_label.pack(pady=10)
+
+        # Горячие клавиши
+        hotkeys_frame = ttk.LabelFrame(main_frame, text="Горячие клавиши", padding="5")
+        hotkeys_frame.pack(fill=tk.X, pady=5)
+
+        hotkeys_text = "Q - Выход из режима сканирования\nC - Очистить все коды"
+        ttk.Label(hotkeys_frame, text=hotkeys_text, justify=tk.LEFT).pack()
+
+    def create_codes_window(self):
+        """Создание окна для отсканированных кодов"""
+        self.codes_window = tk.Toplevel(self.root)
+        self.codes_window.title("Отсканированные коды")
+        self.codes_window.geometry("600x400")
+        self.codes_window.withdraw()
+        
+        # Центрирование окна
+        self.codes_window.update_idletasks()
+        width = self.codes_window.winfo_width()
+        height = self.codes_window.winfo_height()
+        x = (self.codes_window.winfo_screenwidth() // 2) - (width // 2) + 200
+        y = (self.codes_window.winfo_screenheight() // 2) - (height // 2)
+        self.codes_window.geometry(f'{width}x{height}+{x}+{y}')
+
+        # Основной фрейм
+        main_frame = ttk.Frame(self.codes_window, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Заголовок
+        ttk.Label(main_frame, text="Отсканированные коды", 
+                 font=('Arial', 14, 'bold')).pack(pady=(0, 10))
+
+        # Текстовое поле с прокруткой
+        text_frame = ttk.Frame(main_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.codes_text = scrolledtext.ScrolledText(
+            text_frame, wrap=tk.WORD, width=60, height=20,
+            font=('Consolas', 10)
+        )
+        self.codes_text.pack(fill=tk.BOTH, expand=True)
+
+        # Кнопки
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Button(button_frame, text="Очистить список", 
+                  command=self.clear_codes_list).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(button_frame, text="Копировать все", 
+                  command=self.copy_all_codes).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(button_frame, text="Закрыть", 
+                  command=self.codes_window.withdraw).pack(side=tk.RIGHT, padx=5)
+
+        # При закрытии окна - скрываем его
+        self.codes_window.protocol("WM_DELETE_WINDOW", self.codes_window.withdraw)
+
+    def create_settings_window(self):
+        """Создание окна настроек камеры"""
+        self.settings_window = tk.Toplevel(self.root)
+        self.settings_window.title("Настройки камеры")
+        self.settings_window.geometry("500x400")
+        self.settings_window.withdraw()
+        
+        # Центрирование окна
+        self.settings_window.update_idletasks()
+        width = self.settings_window.winfo_width()
+        height = self.settings_window.winfo_height()
+        x = (self.settings_window.winfo_screenwidth() // 2) - (width // 2) - 200
+        y = (self.settings_window.winfo_screenheight() // 2) - (height // 2)
+        self.settings_window.geometry(f'{width}x{height}+{x}+{y}')
+
+        # Основной фрейм
+        main_frame = ttk.Frame(self.settings_window, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main_frame, text="Настройки разрешения камеры", 
+                 font=('Arial', 14, 'bold')).pack(pady=(0, 20))
+
+        # Кнопки разрешений
+        resolutions_frame = ttk.Frame(main_frame)
+        resolutions_frame.pack(fill=tk.X, pady=10)
+
+        for i, (width, height) in enumerate(self.resolutions):
+            btn_text = f"{width}x{height}"
+            btn = ttk.Button(
+                resolutions_frame, 
+                text=btn_text,
+                command=lambda w=width, h=height: self.set_resolution(w, h)
+            )
+            btn.pack(fill=tk.X, pady=2, padx=20)
+
+        # Текущие настройки
+        info_frame = ttk.LabelFrame(main_frame, text="Текущие настройки", padding="10")
+        info_frame.pack(fill=tk.X, pady=20)
+
+        self.settings_info = ttk.Label(
+            info_frame, 
+            text=f"Разрешение: {self.camera_settings['width']}x{self.camera_settings['height']}\n"
+                 f"FPS: {self.camera_settings['fps']}\n"
+                 f"Кодек: MJPG",
+            justify=tk.LEFT
+        )
+        self.settings_info.pack()
+
+        # Кнопка обновления настроек
+        ttk.Button(main_frame, text="Применить настройки", 
+                  command=self.apply_camera_settings).pack(pady=10)
+
+        ttk.Button(main_frame, text="Закрыть", 
+                  command=self.settings_window.withdraw).pack(pady=5)
+
+        # При закрытии окна - скрываем его
+        self.settings_window.protocol("WM_DELETE_WINDOW", self.settings_window.withdraw)
+
+    def show_codes_window(self):
+        """Показать окно с кодами"""
+        self.codes_window.deiconify()
+        self.codes_window.lift()
+
+    def show_settings_window(self):
+        """Показать окно настроек"""
+        self.settings_window.deiconify()
+        self.settings_window.lift()
+
+    def set_resolution(self, width: int, height: int):
+        """Установить разрешение"""
+        self.camera_settings['width'] = width
+        self.camera_settings['height'] = height
+        self.selected_resolution.set(f"{width}x{height}")
+        
+        # Обновляем информацию в окне настроек
+        self.settings_info.config(
+            text=f"Разрешение: {width}x{height}\n"
+                 f"FPS: {self.camera_settings['fps']}\n"
+                 f"Кодек: MJPG"
+        )
+
+    def apply_camera_settings(self):
+        """Применить настройки камеры"""
+        if self.running and self.cap:
+            messagebox.showinfo("Информация", 
+                              "Настройки будут применены при следующем запуске сканирования")
+        else:
+            messagebox.showinfo("Информация", "Настройки сохранены")
+
+    def update_codes_display(self):
+        """Обновить отображение кодов в окне"""
+        self.codes_text.delete(1.0, tk.END)
+        
+        if not self.scanned_codes:
+            self.codes_text.insert(tk.END, "Нет отсканированных кодов")
+            return
+        
+        for i, code in enumerate(self.scanned_codes, 1):
+            timestamp = code.get('timestamp', '')
+            code_text = code.get('code', '')
+            self.codes_text.insert(tk.END, f"{i:3d}. [{timestamp}] {code_text}\n")
+        
+        # Прокрутка вниз
+        self.codes_text.see(tk.END)
+
+    def update_time_display(self):
+        """Обновить отображение времени"""
+        if self.time_for_10_codes:
+            minutes = int(self.time_for_10_codes // 60)
+            seconds = self.time_for_10_codes % 60
+            self.time_label.config(
+                text=f"Время для 10 кодов: {minutes:02d}:{seconds:05.2f}"
+            )
+        else:
+            self.time_label.config(text="Время для 10 кодов: --")
+        
+        self.counter_label.config(text=f"Отсканировано кодов: {self.code_counter}")
+
+    def clear_codes_list(self):
+        """Очистить список кодов в окне"""
+        self.scanned_codes.clear()
+        self.update_codes_display()
+        self.reset_scan()
+
+    def copy_all_codes(self):
+        """Копировать все коды в буфер обмена"""
+        if not self.scanned_codes:
+            return
+        
+        codes_text = "\n".join([f"{i+1}. {item['code']}" 
+                               for i, item in enumerate(self.scanned_codes)])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(codes_text)
+        messagebox.showinfo("Скопировано", "Все коды скопированы в буфер обмена")
 
     # ---------- звук ----------
     def beep(self):
@@ -94,7 +388,9 @@ class DataMatrixScanner:
         self.seen_codes.clear()
         self.tracked.clear()
         self.code_counter = 0
-
+        self.scan_start_time = None
+        self.time_for_10_codes = None
+        
         # очистка очередей decode
         try:
             while not self.decode_queue.empty():
@@ -104,6 +400,11 @@ class DataMatrixScanner:
         except Empty:
             pass
 
+        # Обновить отображение
+        self.update_codes_display()
+        self.update_time_display()
+        
+        self.status_label.config(text="Сканирование очищено", foreground="orange")
         print("Скан очищен — можно сканировать заново")
 
     # ---------- старт ----------
@@ -115,15 +416,19 @@ class DataMatrixScanner:
             messagebox.showerror("Ошибка", f"Не удалось открыть камеру {idx}")
             return
 
-        # стабильный профиль (C920 / iPhone)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Применение настроек камеры
+        self.cap.set(cv2.CAP_PROP_FOURCC, self.camera_settings['fourcc'])
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_settings['width'])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_settings['height'])
+        self.cap.set(cv2.CAP_PROP_FPS, self.camera_settings['fps'])
 
         self.running = True
         self.logged_params = False
 
+        # Обновить статус
+        self.status_label.config(text="Сканирование запущено", foreground="green")
+        
+        # Скрыть основное окно и запустить цикл
         self.root.withdraw()
         self.loop()
 
@@ -186,11 +491,26 @@ class DataMatrixScanner:
     # ---------- основной цикл ----------
     def loop(self):
         while self.running:
+            if self.cap is None:
+                break
+
             ret, frame = self.cap.read()
             if not ret:
                 break
 
-            if not self.logged_params:
+            # ---- цифровой зум (мягкий) ----
+            if self.zoom_factor > 1.0:
+                h, w = frame.shape[:2]
+                cw = int(w / self.zoom_factor)
+                ch = int(h / self.zoom_factor)
+
+                x1 = (w - cw) // 2
+                y1 = (h - ch) // 2
+
+                frame = frame[y1:y1 + ch, x1:x1 + cw]
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+
+            if not self.logged_params and self.cap is not None:
                 w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = int(self.cap.get(cv2.CAP_PROP_FPS))
@@ -231,8 +551,29 @@ class DataMatrixScanner:
                 if code not in self.seen_codes:
                     self.seen_codes.add(code)
                     self.code_counter += 1
-                    print(f"{self.code_counter}. {code}")
+                    
+                    # Добавить в список отсканированных кодов
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    self.scanned_codes.append({
+                        'code': code,
+                        'timestamp': timestamp,
+                        'number': self.code_counter
+                    })
+                    
+                    # Запустить таймер для первого кода
+                    if self.code_counter == 1:
+                        self.scan_start_time = now
+                    
+                    # Зафиксировать время для 10 кодов
+                    if self.code_counter == 10 and self.scan_start_time:
+                        self.time_for_10_codes = now - self.scan_start_time
+                    
+                    print(f"{self.code_counter}. {code} [{timestamp}]")
                     self.beep()
+                    
+                    # Обновить отображение
+                    self.update_codes_display()
+                    self.update_time_display()
 
                 self.tracked[code] = {
                     "polygon": poly,
@@ -255,11 +596,23 @@ class DataMatrixScanner:
                         frame, pts[i], pts[(i+1) % len(pts)],
                         (0, 255, 0), 2
                     )
+            
+            # Добавить информацию на кадр
+            cv2.putText(frame, f"Codes: {self.code_counter}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            if self.time_for_10_codes:
+                time_text = f"Time for 10: {self.time_for_10_codes:.2f}s"
+                cv2.putText(frame, time_text, (10, 70),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-            cv2.imshow("DataMatrix Scanner (Q — выход)", frame)
+            cv2.imshow("DataMatrix Scanner (Q — выход, C — очистка)", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("c"):
+                self.reset_scan()
 
         self.stop()
 
@@ -269,7 +622,8 @@ class DataMatrixScanner:
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
-        self.root.destroy()
+        self.root.deiconify()
+        self.status_label.config(text="Сканирование остановлено", foreground="red")
 
 
 # ---------- entry ----------
