@@ -62,13 +62,13 @@ class DataMatrixScanner:
         self.ROI_TIMEOUT = 0.3
         self.frame_counter = 0
         # лёгкий цифровой зум
-        self.zoom_factor = 1.23
+        self.zoom_factor = 1.0
 
         # Настройки камеры
         self.camera_settings = {
-            'width': 3840,
-            'height': 2160,
-            'fps': 60,
+            'width': 1920,
+            'height': 1080,
+            'fps': 30,
             'fourcc': cv2.VideoWriter.fourcc(*"MJPG")
         }
 
@@ -78,7 +78,7 @@ class DataMatrixScanner:
             (800, 600),
             (1024, 768),
             (1280, 720),
-            (3840, 2160),
+            (1920, 1080),
         ]
 
         # очереди для декодирования
@@ -102,7 +102,7 @@ class DataMatrixScanner:
             return
 
         self.selected_camera = tk.IntVar(value=cams[0])
-        self.selected_resolution = tk.StringVar(value="3840x2160")
+        self.selected_resolution = tk.StringVar(value="1920x1080")
 
         # Создание отдельных окон
         self.create_main_window()
