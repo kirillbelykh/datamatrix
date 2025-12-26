@@ -6,7 +6,7 @@ import numpy as np
 import time
 import sys
 from queue import Empty
-from typing import Optional, Tuple, List
+from typing import Optional
 from datetime import datetime
 
 
@@ -62,7 +62,7 @@ class DataMatrixScanner:
         self.ROI_TIMEOUT = 0.3
         self.frame_counter = 0
         # лёгкий цифровой зум
-        self.zoom_factor = 1.1
+        self.zoom_factor = 1.08
 
         # Настройки камеры
         self.camera_settings = {
@@ -83,7 +83,7 @@ class DataMatrixScanner:
 
         # очереди для декодирования
         import queue
-        self.decode_queue = queue.Queue(maxsize=1)
+        self.decode_queue = queue.Queue(maxsize=4)
         self.result_queue = queue.Queue()
 
         # потокобезопасный lock для кадров
@@ -544,6 +544,7 @@ class DataMatrixScanner:
             self.logged_params = True
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.convertScaleAbs(gray, alpha=0.40, beta=0)
         now = time.time()
 
         self.frame_counter += 1
@@ -623,6 +624,9 @@ class DataMatrixScanner:
                     (0, 255, 0), 2
                 )
         
+        # Понизить яркость отображаемого кадра
+        frame = cv2.convertScaleAbs(frame, alpha=0.8, beta=0)
+
         # Добавить информацию на кадр
         cv2.putText(frame, f"Codes: {self.code_counter}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
