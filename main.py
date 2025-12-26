@@ -62,7 +62,7 @@ class DataMatrixScanner:
         self.ROI_TIMEOUT = 0.3
         self.frame_counter = 0
         # лёгкий цифровой зум
-        self.zoom_factor = 1.23
+        self.zoom_factor = 1.1
 
         # Настройки камеры
         self.camera_settings = {
